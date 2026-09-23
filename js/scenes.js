@@ -114,7 +114,6 @@
       const [bg, gr] = menuColors(this.t);
       Runner.draw(ctx, bg, gr);
       drawLogo(ctx, R.VW / 2, 84, 54, this.t);
-      A.text(ctx, 'a rhythm platformer starring a crab', R.VW / 2, 124, 11, { color: '#ffe4cc' });
       if (!this.ready) {
         const w = 160;
         UI.bar(ctx, R.VW / 2 - w / 2, 170, w, 8, Math.min(1, this.t / 0.9), ['#b8ff78', '#58d41f']);
