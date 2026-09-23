@@ -2,7 +2,7 @@
 
 A one-button rhythm platformer starring a crab. Jump, fly and flip through six levels, from Easy to Demon.
 
-**▶ Play it: https://itsdannyt.github.io/crab-dash/**
+**▶ Play it: https://playcrabdash.com**
 
 ![Crab Dash](og.png)
 
