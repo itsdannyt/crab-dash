@@ -9,33 +9,44 @@
   let musicVol = 0.8, sfxVol = 0.8;
 
   AU.ready = () => !!ctx;
+
+  // The mixer and shared effects, built on any audio context (the live one, or an offline one for video).
+  function buildGraph(c) {
+    const g = {};
+    g.comp = c.createDynamicsCompressor();
+    g.comp.threshold.value = -14; g.comp.knee.value = 10; g.comp.ratio.value = 4; g.comp.attack.value = 0.004; g.comp.release.value = 0.2;
+    g.master = c.createGain(); g.master.gain.value = 0.9;
+    g.comp.connect(g.master); g.master.connect(c.destination);
+    g.musicBus = c.createGain(); g.musicBus.gain.value = musicVol; g.musicBus.connect(g.comp);
+    g.sfxBus = c.createGain(); g.sfxBus.gain.value = sfxVol; g.sfxBus.connect(g.comp);
+    // echo on leads and plucks; its time is set per song (a dotted eighth) in playSong
+    g.delay = c.createDelay(1.5); g.delayFb = c.createGain(); g.delayFb.gain.value = 0.32;
+    const dlp = c.createBiquadFilter(); dlp.type = 'lowpass'; dlp.frequency.value = 3200;
+    g.delayWet = c.createGain(); g.delayWet.gain.value = 0.35;
+    g.delay.connect(dlp); dlp.connect(g.delayFb); g.delayFb.connect(g.delay); dlp.connect(g.delayWet); g.delayWet.connect(g.musicBus);
+    g.verb = c.createConvolver(); g.verb.buffer = impulse(c, 1.8, 2.6);
+    g.verbWet = c.createGain(); g.verbWet.gain.value = 0.28;
+    g.verb.connect(g.verbWet); g.verbWet.connect(g.musicBus);
+    g.noiseBuf = c.createBuffer(1, c.sampleRate, c.sampleRate);
+    const d = g.noiseBuf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    return g;
+  }
+  function useGraph(c, g) {
+    ctx = c;
+    ({ comp, master, musicBus, sfxBus, delay, delayFb, delayWet, verb, verbWet, noiseBuf } = g);
+  }
   AU.init = function () {
     if (ctx) { if (ctx.state === 'suspended' && !AU.paused) ctx.resume(); return; }
     const AC = G.AudioContext || G.webkitAudioContext;
     if (!AC) return;
-    ctx = new AC();
-    comp = ctx.createDynamicsCompressor();
-    comp.threshold.value = -14; comp.knee.value = 10; comp.ratio.value = 4; comp.attack.value = 0.004; comp.release.value = 0.2;
-    master = ctx.createGain(); master.gain.value = 0.9;
-    comp.connect(master); master.connect(ctx.destination);
-    musicBus = ctx.createGain(); musicBus.gain.value = musicVol; musicBus.connect(comp);
-    sfxBus = ctx.createGain(); sfxBus.gain.value = sfxVol; sfxBus.connect(comp);
-    // shared effects for music
-    delay = ctx.createDelay(1.5); delayFb = ctx.createGain(); delayFb.gain.value = 0.32;
-    const dlp = ctx.createBiquadFilter(); dlp.type = 'lowpass'; dlp.frequency.value = 3200;
-    delayWet = ctx.createGain(); delayWet.gain.value = 0.5;
-    delay.connect(dlp); dlp.connect(delayFb); delayFb.connect(delay); dlp.connect(delayWet); delayWet.connect(musicBus);
-    verb = ctx.createConvolver(); verb.buffer = impulse(1.8, 2.6);
-    verbWet = ctx.createGain(); verbWet.gain.value = 0.28;
-    verb.connect(verbWet); verbWet.connect(musicBus);
-    noiseBuf = ctx.createBuffer(1, ctx.sampleRate, ctx.sampleRate);
-    const d = noiseBuf.getChannelData(0);
-    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    const c = new AC();
+    useGraph(c, buildGraph(c));
     setInterval(schedule, 25);
   };
-  function impulse(sec, decay) {
-    const n = Math.floor(ctx.sampleRate * sec);
-    const b = ctx.createBuffer(2, n, ctx.sampleRate);
+  function impulse(c, sec, decay) {
+    const n = Math.floor(c.sampleRate * sec);
+    const b = c.createBuffer(2, n, c.sampleRate);
     for (let c = 0; c < 2; c++) {
       const d = b.getChannelData(c);
       for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / n, decay);
@@ -304,6 +315,7 @@
     const style = STYLES[styleName] || STYLES.lowtide;
     const bus = ctx.createGain(); bus.gain.value = 1; bus.connect(musicBus);
     const spb = 60 / bpm;
+    delay.delayTime.setValueAtTime(spb * 0.75, ctx.currentTime);
     const secs = [];
     let bar = 0;
     for (const s of sections) { secs.push({ bar0: bar, bars: s.bars, part: s.part }); bar += s.bars; }
@@ -345,9 +357,9 @@
   }
 
   // ───────────────────────── sound effects ─────────────────────────
-  AU.sfx = function (name, v = 1) {
+  AU.sfx = function (name, v = 1, at) {
     if (!ctx) return;
-    const t = ctx.currentTime + 0.005;
+    const t = at != null ? at : ctx.currentTime + 0.005;
     const out = sfxBus;
     switch (name) {
       case 'death': {
@@ -396,4 +408,37 @@
     g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
     o.connect(g); g.connect(out); o.start(t); o.stop(t + dur + 0.05);
   }
+  // ───────────────────────── offline rendering (for videos) ─────────────────────────
+  // Renders song time t0..t1 of a level's soundtrack to an AudioBuffer, faster than real time and sample-exact,
+  // plus any sound effects given as { t, name } in song time. A preroll lets notes that began before t0 ring in.
+  AU.renderOffline = async function (styleName, bpm, sections, t0, t1, opts = {}) {
+    const rate = opts.rate || 48000, pre = opts.preroll == null ? 2 : opts.preroll, tail = opts.tail == null ? 1 : opts.tail;
+    const OAC = G.OfflineAudioContext || G.webkitOfflineAudioContext;
+    const off = new OAC(2, Math.ceil((t1 - t0 + pre + tail) * rate), rate);
+    const saved = ctx ? { c: ctx, g: { comp, master, musicBus, sfxBus, delay, delayFb, delayWet, verb, verbWet, noiseBuf } } : null;
+    useGraph(off, buildGraph(off));
+    try {
+      const style = STYLES[styleName] || STYLES.lowtide, spb = 60 / bpm, s16 = spb / 4;
+      delay.delayTime.value = spb * 0.75;
+      const secs = [];
+      let bars = 0;
+      for (const s of sections) { secs.push({ bar0: bars, bars: s.bars, part: s.part }); bars += s.bars; }
+      const bus = off.createGain();
+      bus.connect(musicBus);
+      const shift = pre - t0; // offline clock = song time + shift
+      for (let st = Math.max(0, Math.ceil((t0 - pre) / s16)); st * s16 <= t1; st++) {
+        const barAbs = Math.floor(st / 16);
+        if (barAbs >= bars) break;
+        const sec = secs.find((x) => barAbs >= x.bar0 && barAbs < x.bar0 + x.bars);
+        playStep(bus, style, sec.part, barAbs - sec.bar0, sec.bars, barAbs, st % 16, st * s16 + shift, spb);
+      }
+      const end = t1 + shift, fade = opts.fade == null ? 0.5 : opts.fade;
+      bus.gain.setValueAtTime(1, end - fade);
+      bus.gain.linearRampToValueAtTime(0.0001, end);
+      for (const e of opts.events || []) if (e.t >= t0 && e.t <= t1) AU.sfx(e.name, e.v || 1, e.t + shift);
+    } finally {
+      if (saved) useGraph(saved.c, saved.g); else ctx = null;
+    }
+    return { buffer: await off.startRendering(), preroll: pre };
+  };
 })(typeof globalThis !== 'undefined' ? globalThis : window);
